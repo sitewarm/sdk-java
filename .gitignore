@@ -1,0 +1,6 @@
+target/
+build/
+.openapi-generator/
+.idea/
+*.iml
+.DS_Store
