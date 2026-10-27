@@ -10,7 +10,9 @@ import com.sitewarm.sdk.model.Site;
 import com.sitewarm.sdk.model.SiteCreate;
 import com.sitewarm.sdk.model.WarmRun;
 import com.sitewarm.sdk.model.WarmRunCreate;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -21,10 +23,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Matcher;
@@ -39,6 +43,10 @@ public final class SiteWarm {
     private static final Pattern PATH_PARAM = Pattern.compile("\\{(\\w+)}");
     private static final Pattern SLUG = Pattern.compile("^[a-z0-9-]+$");
 
+    /** Largest response body that is read (32 MiB). */
+    static final int MAX_BODY = 32 << 20;
+    static final int MAX_PAGES = 10_000;
+
     static final ObjectMapper MAPPER = new ObjectMapper()
             .registerModule(new JavaTimeModule())
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -49,6 +57,8 @@ public final class SiteWarm {
     interface Sleeper {
         void sleep(Duration d) throws InterruptedException;
     }
+
+    private static final Set<String> REPEATABLE = Set.of("GET", "HEAD", "PUT", "OPTIONS");
 
     private final String apiKey;
     private final String baseUrl;
@@ -104,9 +114,11 @@ public final class SiteWarm {
             this.baseUrl = normalize(baseUrl);
         }
 
-        public Builder maxRetries(int n) { this.maxRetries = n; return this; }
+        /** Retries after the first attempt (default 3). A negative value keeps the default. */
+        public Builder maxRetries(int n) { if (n >= 0) this.maxRetries = n; return this; }
         public Builder retryDelays(Duration base, Duration max) { this.retryBase = base; this.retryMax = max; return this; }
-        public Builder timeout(Duration d) { this.timeout = d; return this; }
+        /** Per-attempt timeout (default 30 s). Null, zero or a negative value keeps the default. */
+        public Builder timeout(Duration d) { if (d != null && !d.isZero() && !d.isNegative()) this.timeout = d; return this; }
         public Builder userAgent(String s) { this.userAgent = s; return this; }
         Builder sleeper(Sleeper s) { this.sleeper = s; return this; }
 
@@ -164,9 +176,10 @@ public final class SiteWarm {
         Operation op = Operations.TABLE.get(operationId);
         if (op == null) throw new SiteWarmException("unknown operation \"" + operationId + "\"");
         StringBuilder url = new StringBuilder(baseUrl).append(expand(op.path(), req.path()));
-        if (!req.query().isEmpty()) {
+        Map<String, String> query = checkedQuery(req.query());
+        if (!query.isEmpty()) {
             url.append('?');
-            req.query().forEach((k, v) -> url.append(enc(k)).append('=').append(enc(v)).append('&'));
+            query.forEach((k, v) -> url.append(enc(k)).append('=').append(enc(v)).append('&'));
             url.setLength(url.length() - 1);
         }
         String body = null;
@@ -180,8 +193,9 @@ public final class SiteWarm {
         boolean sendsKey = op.idempotency() != Operation.Idempotency.NONE && op.method().equals("POST");
         // One key per call, reused by every retry, so a retried POST never starts a second run.
         String key = sendsKey ? (req.idempotencyKey() != null ? req.idempotencyKey() : UUID.randomUUID().toString()) : null;
-        // 429 = not processed. 5xx and network errors may have been, so retry them only when repeating is safe.
-        boolean retryAmbiguous = !op.method().equals("POST") || sendsKey;
+        // 429 = not processed. 5xx, network errors and broken bodies may have been, so retry them only when
+        // repeating is safe: GET, HEAD, PUT, OPTIONS, or a POST with an Idempotency-Key. DELETE and PATCH: 429 only.
+        boolean retryAmbiguous = REPEATABLE.contains(op.method()) || sendsKey;
 
         for (int attempt = 0; ; attempt++) {
             boolean last = attempt >= maxRetries;
@@ -194,9 +208,9 @@ public final class SiteWarm {
             rb.method(op.method(), body == null ? HttpRequest.BodyPublishers.noBody()
                     : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
 
-            HttpResponse<String> resp;
+            HttpResponse<InputStream> resp;
             try {
-                resp = http.send(rb.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                resp = http.send(rb.build(), HttpResponse.BodyHandlers.ofInputStream());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new SiteWarmException("interrupted", e);
@@ -211,8 +225,20 @@ public final class SiteWarm {
             }
 
             int status = resp.statusCode();
+            String text;
+            try (InputStream in = resp.body()) {
+                text = new String(readLimited(in, MAX_BODY), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                // A body that breaks off is as ambiguous as a network error, except after a 429.
+                if (!last && (retryAmbiguous || status == 429)) {
+                    pause(backoff(attempt));
+                    continue;
+                }
+                boolean timedOut = e instanceof java.net.http.HttpTimeoutException || e instanceof java.net.SocketTimeoutException;
+                throw new SiteWarmException.Connection(timedOut ? "request timed out" : "response body failed", timedOut, null);
+            }
             if (status >= 200 && status < 300) {
-                return new Response(status, resp.headers().map(), parse(resp.body(), status));
+                return new Response(status, resp.headers().map(), parse(text, status));
             }
             Duration retryAfter = parseRetryAfter(resp.headers().firstValue("Retry-After").orElse(null));
             boolean retryable = status == 429 || (status >= 500 && status != 501 && retryAmbiguous);
@@ -223,7 +249,7 @@ public final class SiteWarm {
                     continue;
                 }
             }
-            throw apiError(status, resp, retryAfter);
+            throw apiError(status, text, resp.headers(), retryAfter);
         }
     }
 
@@ -250,10 +276,44 @@ public final class SiteWarm {
         }
     }
 
-    private static SiteWarmException.Api apiError(int status, HttpResponse<String> resp, Duration retryAfter) {
+    /** Reads at most {@code limit + 1} bytes; a larger body throws {@link SiteWarmException.ResponseTooLarge}. */
+    static byte[] readLimited(InputStream in, int limit) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        long total = 0;
+        int n;
+        while ((n = in.read(buf)) >= 0) {
+            total += n;
+            if (total > limit) throw new SiteWarmException.ResponseTooLarge(limit);
+            out.write(buf, 0, n);
+        }
+        return out.toByteArray();
+    }
+
+    /** {@code limit} must be 1..100 (empty or 0 = server default, not sent); invalid values never reach the server. */
+    private static Map<String, String> checkedQuery(Map<String, String> query) {
+        String limit = query.get("limit");
+        if (limit == null) return query;
+        String v = limit.trim();
+        Map<String, String> out = new java.util.LinkedHashMap<>(query);
+        if (v.isEmpty() || v.equals("0")) {
+            out.remove("limit");
+            return out;
+        }
+        int n;
+        try {
+            n = Integer.parseInt(v);
+        } catch (NumberFormatException e) {
+            throw new SiteWarmException("limit must be an integer between 1 and 100");
+        }
+        if (n < 1 || n > 100) throw new SiteWarmException("limit must be an integer between 1 and 100");
+        return out;
+    }
+
+    private static SiteWarmException.Api apiError(int status, String body, java.net.http.HttpHeaders headers, Duration retryAfter) {
         JsonNode p;
         try {
-            p = MAPPER.readTree(resp.body());
+            p = MAPPER.readTree(body);
         } catch (IOException | RuntimeException e) {
             p = null;
         }
@@ -267,7 +327,7 @@ public final class SiteWarm {
             if (SLUG.matcher(slug).matches()) code = slug;
         }
         OptionalInt remaining = OptionalInt.empty();
-        String rl = resp.headers().firstValue("RateLimit-Remaining").map(String::trim).orElse("");
+        String rl = headers.firstValue("RateLimit-Remaining").map(String::trim).orElse("");
         if (rl.matches("\\d+")) remaining = OptionalInt.of(Integer.parseInt(rl));
         return new SiteWarmException.Api(status, p, code, retryAfter, remaining);
     }
@@ -302,10 +362,18 @@ public final class SiteWarm {
 
     // ---- pagination ----
 
-    /** Iterates every item of a list operation across pages. Cursors are opaque. */
+    /**
+     * Iterates every item of a list operation across pages. Cursors are opaque. Throws if a cursor repeats or
+     * if 10,000 pages did not reach the end.
+     */
     public <T> Iterable<T> items(String operationId, Request req, Class<T> type) {
+        return items(operationId, req, type, MAX_PAGES);
+    }
+
+    <T> Iterable<T> items(String operationId, Request req, Class<T> type, int maxPages) {
         return () -> new Iterator<>() {
             private String cursor = req.query().get("cursor");
+            private final Set<String> seen = new HashSet<>(cursor == null ? Set.of() : Set.of(cursor));
             private Iterator<JsonNode> page = java.util.Collections.emptyIterator();
             private boolean more = true;
             private int pages = 0;
@@ -313,14 +381,17 @@ public final class SiteWarm {
             @Override
             public boolean hasNext() {
                 while (!page.hasNext() && more) {
-                    if (pages++ >= 10_000) return false;
+                    if (pages >= maxPages) {
+                        throw new SiteWarmException("pagination stopped after " + maxPages + " pages without reaching the end");
+                    }
+                    pages++;
                     Request r = cursor == null ? req : req.withQuery("cursor", cursor);
                     JsonNode n = call(operationId, r);
                     page = n.path("data").iterator();
                     JsonNode info = n.path("page");
                     String next = info.path("next_cursor").isTextual() ? info.get("next_cursor").asText() : null;
                     more = info.path("has_more").asBoolean(false) && next != null && !next.isEmpty();
-                    if (more && next.equals(cursor)) throw new SiteWarmException("pagination cursor did not advance");
+                    if (more && !seen.add(next)) throw new SiteWarmException("pagination cursor did not advance");
                     cursor = next;
                 }
                 return page.hasNext();

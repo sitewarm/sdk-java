@@ -28,6 +28,20 @@ public class SiteWarmException extends RuntimeException {
         }
     }
 
+    /** The response body was larger than the SDK reads (32 MiB). Not retried. */
+    public static final class ResponseTooLarge extends SiteWarmException {
+        private final int limit;
+
+        public ResponseTooLarge(int limit) {
+            super("response body is larger than " + limit + " bytes");
+            this.limit = limit;
+        }
+
+        public int limit() {
+            return limit;
+        }
+    }
+
     /** {@code WarmRuns.waitFor} gave up. The run keeps going server side and is NOT canceled. */
     public static final class WaitTimeout extends SiteWarmException {
         private final String runId;

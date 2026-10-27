@@ -25,10 +25,11 @@ A site must be verified before a run is accepted; verification happens outside t
 
 ## Behavior
 
-- **Auth**: `Authorization: Bearer <key>`. The key is not in `toString()`, exception messages or logs (the SDK never logs). The base URL must be https (http only for localhost) with no credentials or query; redirects are not followed, so the key never goes to another origin.
+- **Auth**: `Authorization: Bearer <key>`. The key is not in `toString()`, exception messages or logs (the SDK never logs), and the client is not `Serializable`. The base URL must be https (http only for localhost) with no credentials or query. The SDK builds its own `HttpClient` with redirects disabled (there is no way to pass one in), so the key never goes to another origin; a 3xx is thrown as `SiteWarmException.Api`.
 - **No default base URL**: pass the API host you were given.
-- **Retries**: up to 3 on `429`, `5xx` and network errors, exponential backoff with equal jitter, capped at 30 s. `Retry-After` is honored; if it exceeds the cap the error is thrown instead of sleeping. `429` is always retried; `5xx` and network errors only when repeating is safe (not a POST, or a POST with an `Idempotency-Key`).
+- **Retries**: up to 3 (`maxRetries`; a negative value keeps the default) on `429`, `5xx` (not `501`) and network errors, exponential backoff with equal jitter, capped at 30 s. `Retry-After` is honored; if it exceeds the cap the error is thrown instead of sleeping. `429` is always retried; `5xx`, network errors and a response body that breaks off only when repeating is safe (`GET`, `HEAD`, `PUT`, `OPTIONS`, or a POST with an `Idempotency-Key`; never `DELETE`/`PATCH`). `timeout(null / zero / negative)` keeps the default (30 s).
 - **Idempotency**: every POST that accepts `Idempotency-Key` sends one (random UUID unless you pass one), generated once per call and reused by its retries, so a retried `warmRuns.create` never starts two runs.
+- **Limits**: response bodies over 32 MiB throw `SiteWarmException.ResponseTooLarge` (not retried); item iteration throws on a repeated cursor or after 10,000 pages instead of stopping silently; a `limit` query value outside 1..100 throws before the request (empty or 0 = server default).
 - **Errors**: `SiteWarmException.Api` (`status()`, `kind()`, RFC 9457 `code()`, `retryAfter()`, `rateLimitRemaining()`), `SiteWarmException.Connection`, and `SiteWarmException.WaitTimeout` from `waitFor`, which does not cancel the run.
 
 ## Development
