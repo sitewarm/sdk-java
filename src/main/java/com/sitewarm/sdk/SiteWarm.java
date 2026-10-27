@@ -58,6 +58,11 @@ public final class SiteWarm {
         void sleep(Duration d) throws InterruptedException;
     }
 
+    /** SDK version, sent in the User-Agent. A test keeps it equal to the pom version. */
+    public static final String VERSION = "0.1.0-SNAPSHOT";
+
+    static final String DEFAULT_USER_AGENT = "sitewarm-java/" + VERSION + " (+https://github.com/sitewarm/sdk-java)";
+
     private static final Set<String> REPEATABLE = Set.of("GET", "HEAD", "PUT", "OPTIONS");
 
     private final String apiKey;
@@ -102,7 +107,7 @@ public final class SiteWarm {
         private Duration retryBase = Duration.ofMillis(500);
         private Duration retryMax = Duration.ofSeconds(30);
         private Duration timeout = Duration.ofSeconds(30);
-        private String userAgent = "sitewarm-java";
+        private String userAgent = DEFAULT_USER_AGENT;
         private Sleeper sleeper = d -> Thread.sleep(d.toMillis());
 
         private Builder(String apiKey, String baseUrl) {
@@ -119,7 +124,8 @@ public final class SiteWarm {
         public Builder retryDelays(Duration base, Duration max) { this.retryBase = base; this.retryMax = max; return this; }
         /** Per-attempt timeout (default 30 s). Null, zero or a negative value keeps the default. */
         public Builder timeout(Duration d) { if (d != null && !d.isZero() && !d.isNegative()) this.timeout = d; return this; }
-        public Builder userAgent(String s) { this.userAgent = s; return this; }
+        /** Overrides the User-Agent. Null or empty keeps the default. */
+        public Builder userAgent(String s) { if (s != null && !s.isEmpty()) this.userAgent = s; return this; }
         Builder sleeper(Sleeper s) { this.sleeper = s; return this; }
 
         public SiteWarm build() { return new SiteWarm(this); }
@@ -199,23 +205,30 @@ public final class SiteWarm {
 
         for (int attempt = 0; ; attempt++) {
             boolean last = attempt >= maxRetries;
-            HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url.toString())).timeout(timeout)
-                    .header("Authorization", "Bearer " + apiKey)
-                    .header("Accept", "application/json, application/problem+json")
-                    .header("User-Agent", userAgent);
-            if (body != null) rb.header("Content-Type", "application/json");
-            if (key != null) rb.header("Idempotency-Key", key);
-            rb.method(op.method(), body == null ? HttpRequest.BodyPublishers.noBody()
-                    : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+            HttpRequest request;
+            try {
+                HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url.toString())).timeout(timeout)
+                        .header("Authorization", "Bearer " + apiKey)
+                        .header("Accept", "application/json, application/problem+json")
+                        .header("User-Agent", userAgent);
+                if (body != null) rb.header("Content-Type", "application/json");
+                if (key != null) rb.header("Idempotency-Key", key);
+                rb.method(op.method(), body == null ? HttpRequest.BodyPublishers.noBody()
+                        : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+                request = rb.build();
+            } catch (IllegalArgumentException e) {
+                // An invalid header value or URL: repeating cannot fix it. The message may echo a value, so it is dropped.
+                throw new SiteWarmException("malformed request (invalid header or URL)");
+            }
 
             HttpResponse<InputStream> resp;
             try {
-                resp = http.send(rb.build(), HttpResponse.BodyHandlers.ofInputStream());
+                resp = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new SiteWarmException("interrupted", e);
             } catch (IOException e) {
-                if (!last && retryAmbiguous) {
+                if (!last && retryAmbiguous && isTransient(e)) {
                     pause(backoff(attempt));
                     continue;
                 }
@@ -241,16 +254,43 @@ public final class SiteWarm {
                 return new Response(status, resp.headers().map(), parse(text, status));
             }
             Duration retryAfter = parseRetryAfter(resp.headers().firstValue("Retry-After").orElse(null));
+            SiteWarmException.Api error = apiError(status, text, resp.headers(), retryAfter);
             boolean retryable = status == 429 || (status >= 500 && status != 501 && retryAmbiguous);
+            // A 409 "conflict" on a keyed POST is the original request still running (a timeout retry racing it).
+            // "idempotency-key-reused" is a caller bug and is never retried.
+            if (status == 409 && sendsKey && "conflict".equals(error.code())) retryable = true;
             if (retryable && !last) {
-                Duration wait = retryAfter != null ? retryAfter : backoff(attempt);
-                if (wait.compareTo(retryMax) <= 0) { // a longer server-provided wait is surfaced, not ignored
-                    pause(wait);
+                // Never a hot retry on "Retry-After: 0" or a date in the past; jitter spreads clients out.
+                // A server-provided wait longer than the cap is surfaced, not slept.
+                Duration floored = retryAfter == null ? null : retryAfter.compareTo(retryBase) < 0 ? retryBase : retryAfter;
+                if (floored == null || floored.compareTo(retryMax) <= 0) {
+                    pause(floored == null ? backoff(attempt)
+                            : floored.plusMillis((long) (ThreadLocalRandom.current().nextDouble() * floored.toMillis() / 4)));
                     continue;
                 }
             }
-            throw apiError(status, text, resp.headers(), retryAfter);
+            throw error;
         }
+    }
+
+    /**
+     * False for failures that repeating cannot fix: certificate verification, unknown host and malformed requests.
+     * Other network errors are retried.
+     */
+    static boolean isTransient(Throwable t) {
+        for (int i = 0; t != null && i < 8; i++, t = t.getCause()) {
+            // HttpClient reports an unresolvable host as a ConnectException caused by UnresolvedAddressException.
+            if (t instanceof java.net.UnknownHostException
+                    || t instanceof java.nio.channels.UnresolvedAddressException
+                    || t instanceof javax.net.ssl.SSLPeerUnverifiedException
+                    || t instanceof java.security.cert.CertificateException
+                    || t instanceof java.security.cert.CertPathValidatorException) {
+                return false;
+            }
+            String m = t.getMessage();
+            if (m != null && m.toLowerCase(java.util.Locale.ROOT).contains("invalid header")) return false;
+        }
+        return true;
     }
 
     private void pause(Duration d) {
@@ -272,7 +312,7 @@ public final class SiteWarm {
         try {
             return MAPPER.readTree(text);
         } catch (IOException e) {
-            throw new SiteWarmException("invalid JSON in " + status + " response");
+            throw new SiteWarmException.Decode(status); // no cause: a parser message can quote the body
         }
     }
 

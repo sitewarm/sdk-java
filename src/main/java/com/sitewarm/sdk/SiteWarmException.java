@@ -42,6 +42,20 @@ public class SiteWarmException extends RuntimeException {
         }
     }
 
+    /** A 2xx response body was not valid JSON (for example an HTML page from a proxy). Never includes the body. */
+    public static final class Decode extends SiteWarmException {
+        private final int status;
+
+        public Decode(int status) {
+            super("invalid JSON in " + status + " response");
+            this.status = status;
+        }
+
+        public int status() {
+            return status;
+        }
+    }
+
     /** {@code WarmRuns.waitFor} gave up. The run keeps going server side and is NOT canceled. */
     public static final class WaitTimeout extends SiteWarmException {
         private final String runId;
